@@ -39,6 +39,24 @@ class HistoryMove:
     file_mtime_ns: int | None
 
 
+def _encode_file_id(value: int) -> str:
+    """Preserve platform file IDs without SQLite's signed 64-bit limit.
+
+    The prefix is essential for backwards compatibility with existing SQLite
+    INTEGER-affinity columns: plain numeric strings may be coerced to REAL.
+    """
+    return f"id:{value}"
+
+
+def _decode_file_id(value: int | str | None) -> int | None:
+    """Read both new text IDs and IDs stored by earlier versions."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.startswith("id:"):
+        return int(value[3:])
+    return int(value)
+
+
 @dataclass(frozen=True)
 class HistoryBatch:
     id: int
@@ -105,8 +123,8 @@ class HistoryDB:
                 detail TEXT NOT NULL DEFAULT '',
                 undo_status TEXT NOT NULL DEFAULT '',
                 undo_detail TEXT NOT NULL DEFAULT '',
-                file_dev INTEGER,
-                file_ino INTEGER,
+                file_dev TEXT,
+                file_ino TEXT,
                 file_size INTEGER,
                 file_mtime_ns INTEGER
             );
@@ -150,14 +168,19 @@ class HistoryDB:
 
     def record_result(self, row_id: int, result: MoveResult) -> None:
         """Record outcome and file identity to prevent unsafe future undos."""
-        identity: tuple[int, int, int, int] | tuple[None, None, None, None]
+        identity: tuple[str, str, int, int] | tuple[None, None, None, None]
         if result.status is MoveStatus.MOVED:
             try:
                 info = result.move.destination.lstat()
                 if not stat.S_ISREG(info.st_mode):
                     identity = (None, None, None, None)
                 else:
-                    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+                    identity = (
+                        _encode_file_id(info.st_dev),
+                        _encode_file_id(info.st_ino),
+                        info.st_size,
+                        info.st_mtime_ns,
+                    )
             except OSError:
                 identity = (None, None, None, None)
         else:
@@ -245,8 +268,8 @@ class HistoryDB:
                 destination=self._restore_path(str(r["destination"])),
                 status=str(r["status"]),
                 undo_status=str(r["undo_status"]),
-                file_dev=r["file_dev"],
-                file_ino=r["file_ino"],
+                file_dev=_decode_file_id(r["file_dev"]),
+                file_ino=_decode_file_id(r["file_ino"]),
                 file_size=r["file_size"],
                 file_mtime_ns=r["file_mtime_ns"],
             )
