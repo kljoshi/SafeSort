@@ -186,3 +186,44 @@ def test_history_survives_renaming_folder(tmp_path: Path) -> None:
     folder.rename(new_folder)
     assert main(["undo", str(new_folder), "--yes"]) == 0
     assert (new_folder / "a.jpg").read_text() == "contents"
+
+
+def test_large_windows_file_ids_are_saved_losslessly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows file IDs may exceed SQLite's signed 64-bit integer range."""
+    from types import SimpleNamespace
+
+    from safesort.models import MoveResult, MoveStatus, PlannedMove
+
+    folder, _rules = setup_folder(tmp_path)
+    source = folder / "a.jpg"
+    destination = folder / "Images" / "a.jpg"
+    destination.parent.mkdir()
+    destination.write_text("unchanged")
+    move = PlannedMove(1, source, destination, "Images")
+    real_lstat = Path.lstat
+    large_dev, large_ino = 2**70 + 7, 2**100 + 17
+
+    def fake_lstat(path: Path):
+        info = real_lstat(path)
+        if path == destination:
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_dev=large_dev,
+                st_ino=large_ino,
+                st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns,
+            )
+        return info
+
+    with HistoryDB(folder, create=True) as db:
+        batch_id, ids = db.start_batch([move])
+        monkeypatch.setattr(Path, "lstat", fake_lstat)
+        db.record_result(ids[0], MoveResult(move, MoveStatus.MOVED))
+        found = db.latest_undoable()
+        assert found is not None
+        recorded_batch, moves = found
+        assert recorded_batch == batch_id
+        assert len(moves) == 1
+        assert moves[0].file_dev == large_dev
+        assert moves[0].file_ino == large_ino
+        assert matches_identity(moves[0])
