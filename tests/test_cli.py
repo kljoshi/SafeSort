@@ -272,4 +272,5 @@ def test_preview_without_rules_file_uses_bundled_defaults(
     (folder / "photo.jpg").write_text("photo")
     monkeypatch.chdir(tmp_path)
     assert main(["preview", str(folder)]) == 0
-    assert "photo.jpg -> Images/photo.jpg" in capsys.readouterr().out
+    expected = f"photo.jpg -> {Path('Images') / 'photo.jpg'}"
+    assert expected in capsys.readouterr().out
