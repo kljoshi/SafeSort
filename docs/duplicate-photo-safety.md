@@ -22,12 +22,15 @@ be scanned and quarantined as usual.
 into `<root>/.safesort-quarantine/` for review. Those files continue to use
 storage. `duplicates restore` reverses supported quarantine moves.
 
-SafeSort does **not** automatically delete quarantined files or currently
-provide a `duplicates purge` command. After independently reviewing copies
-and keeping a backup, you can manually delete unnecessary quarantined files.
-Doing so prevents SafeSort from restoring those files; stale journal entries
-may remain. Moving files to macOS Trash does not normally reclaim their space
-until the Trash is emptied. Actual savings can differ from estimates due to
+SafeSort does **not** automatically delete quarantined files. Version 0.4.0
+adds `duplicates list` and `duplicates purge --preview`, plus an interactive
+`duplicates purge` command requiring a selection and typed batch confirmation.
+Purge verifies an identical retained photo outside quarantine and the recorded
+quarantined file identity before removing anything. Deletions are irreversible
+and remain in the SQLite journal; unexpected interruptions require manual review.
+You can also delete quarantined files manually after reviewing them, but doing
+so leaves stale journal entries and prevents restoration. Moving files to
+macOS Trash does not normally reclaim their space until the Trash is emptied. Actual savings can differ from estimates due to
 filesystem snapshots, hard links, and storage optimization.
 
 **Never manipulate files within a `.photoslibrary` package directly.**

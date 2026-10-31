@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 — Reviewed duplicate purge
+
+- Added `duplicates list` to inspect files in the latest restorable quarantine batch.
+- Added `duplicates purge <folder> --preview` to examine deletion candidates without changes.
+- Added interactive `duplicates purge <folder>` with explicit selection and `DELETE <batch>` confirmation.
+- Verify retained, byte-identical photo exists outside quarantine before deleting any copy.
+- Verify each quarantined photo's recorded hash and file identity before deletion.
+- Journal purge intent before unlinking and record irreversible deletions afterward.
+- Preserve an interrupted purge as a manual-review condition rather than retrying automatically.
+
 ## 0.3.0 — Exact duplicate photo finder
 
 - Added `duplicates scan` to find SHA-256 identical photos recursively in one

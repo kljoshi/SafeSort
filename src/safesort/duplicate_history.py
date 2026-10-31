@@ -152,7 +152,7 @@ class DuplicateHistory:
         try:
             batch = self.connection.execute("""
                 SELECT batch_id FROM duplicate_moves
-                WHERE status='pending' OR (status='moved' AND restore_status!='restored')
+                WHERE status='pending' OR (status='moved' AND restore_status NOT IN ('restored', 'purged'))
                 ORDER BY batch_id DESC LIMIT 1
             """).fetchone()
             if batch is None:
@@ -165,11 +165,20 @@ class DuplicateHistory:
             if pending:
                 raise DuplicateHistoryError(
                     f"Quarantine batch #{batch_id} has {pending} interrupted move(s). "
-                    "Inspect the files and journal manually before restoring."
+                    "Inspect the files and journal manually before restoring or purging."
+                )
+            interrupted = self.connection.execute(
+                "SELECT COUNT(*) FROM duplicate_moves WHERE batch_id=? AND restore_status='purging'",
+                (batch_id,),
+            ).fetchone()[0]
+            if interrupted:
+                raise DuplicateHistoryError(
+                    f"Quarantine batch #{batch_id} has {interrupted} interrupted purge(s). "
+                    "Inspect quarantine and the journal manually; do not retry automatically."
                 )
             rows = self.connection.execute("""
                 SELECT * FROM duplicate_moves WHERE batch_id=?
-                AND status='moved' AND restore_status!='restored'
+                AND status='moved' AND restore_status NOT IN ('restored', 'purged', 'purging')
                 ORDER BY ordinal DESC
             """, (batch_id,)).fetchall()
             result: list[QuarantinedPhoto] = []
@@ -186,6 +195,53 @@ class DuplicateHistory:
             return batch_id, result
         except sqlite3.Error as exc:
             raise DuplicateHistoryError(f"Cannot read duplicate history: {exc}") from exc
+
+    def begin_purge(self, row_id: int) -> None:
+        """Persist intent before deleting; a crash leaves a detectable interrupted purge."""
+        try:
+            with self.connection:
+                changed = self.connection.execute(
+                    """UPDATE duplicate_moves SET restore_status='purging'
+                       WHERE id=? AND status='moved' AND restore_status=''""",
+                    (row_id,),
+                ).rowcount
+                if changed != 1:
+                    raise DuplicateHistoryError(
+                        "This quarantine entry is no longer eligible for purge"
+                    )
+        except sqlite3.Error as exc:
+            raise DuplicateHistoryError(f"Cannot record purge intent: {exc}") from exc
+
+    def finish_purge(self, row_id: int) -> None:
+        """Record irreversible deletion; rows remain for audit but cannot be restored."""
+        try:
+            with self.connection:
+                changed = self.connection.execute(
+                    """UPDATE duplicate_moves SET restore_status='purged'
+                       WHERE id=? AND restore_status='purging'""",
+                    (row_id,),
+                ).rowcount
+                if changed != 1:
+                    raise DuplicateHistoryError("Could not finalize purge journal row")
+        except sqlite3.Error as exc:
+            raise DuplicateHistoryError(
+                "Deletion may have completed but journaling failed. "
+                "Inspect quarantine and the journal manually."
+            ) from exc
+
+    def abort_purge(self, row_id: int) -> None:
+        """Only retry if the unchanged quarantined photo is still present."""
+        try:
+            with self.connection:
+                self.connection.execute(
+                    """UPDATE duplicate_moves SET restore_status=''
+                       WHERE id=? AND restore_status='purging'""",
+                    (row_id,),
+                )
+        except sqlite3.Error as exc:
+            raise DuplicateHistoryError(
+                "Cannot reset failed purge journal entry; inspect manually."
+            ) from exc
 
     def record_restore(self, row_id: int, result: MoveResult) -> None:
         try:

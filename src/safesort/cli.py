@@ -10,9 +10,11 @@ from pathlib import Path
 
 from safesort.errors import SafeSortError
 from safesort.duplicates import (
-    QUARANTINE_FOLDER, DuplicateGroup, DuplicateScan, Photo, find_duplicates, unchanged,
+    QUARANTINE_FOLDER, DuplicateGroup, DuplicateScan, Photo, find_duplicates, hash_photo, unchanged,
 )
-from safesort.duplicate_history import DuplicateHistory, quarantine_identity_matches
+from safesort.duplicate_history import (
+    DuplicateHistory, QuarantinedPhoto, quarantine_identity_matches,
+)
 from safesort.executor import execute_move
 from safesort.history import HistoryDB, matches_identity
 from safesort.models import MoveStatus, PlannedMove, ScanResult
@@ -114,6 +116,11 @@ def build_parser() -> argparse.ArgumentParser:
     dup_restore = dup_sub.add_parser("restore", help="restore the latest quarantined batch")
     dup_restore.add_argument("folder", type=Path)
     dup_restore.add_argument("--yes", action="store_true", help="restore without confirmation")
+    dup_list = dup_sub.add_parser("list", help="list pending photos in the latest quarantine batch")
+    dup_list.add_argument("folder", type=Path)
+    dup_purge = dup_sub.add_parser("purge", help="permanently delete selected quarantined photos")
+    dup_purge.add_argument("folder", type=Path)
+    dup_purge.add_argument("--preview", action="store_true", help="show eligible files without deleting")
     return parser
 
 
@@ -313,7 +320,140 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
         return 0
     if args.duplicates_command == "quarantine":
         return _quarantine_duplicates(args)
-    return _restore_duplicates(args)
+    if args.duplicates_command == "restore":
+        return _restore_duplicates(args)
+    return _review_quarantine(args)
+
+
+def _retained_photo_candidates(root: Path, items: list[QuarantinedPhoto]) -> dict[tuple[int, str], list[Photo]]:
+    """Find matching retained copies outside quarantine before any permanent deletion."""
+    wanted = {(item.size, item.sha256) for item in items}
+    sizes = {item.size for item in items}
+    found: dict[tuple[int, str], list[Photo]] = {}
+    result = scan(root, recursive=True, include_hidden=True)
+    for file in result.files:
+        if QUARANTINE_FOLDER in file.path.relative_to(root).parts or file.size not in sizes:
+            continue
+        # Do not count arbitrary documents as retained *photo* copies.
+        from safesort.duplicates import PHOTO_EXTENSIONS
+        if file.path.suffix.lower() not in PHOTO_EXTENSIONS:
+            continue
+        try:
+            digest, info = hash_photo(file.path)
+        except OSError:
+            continue
+        key = (file.size, digest)
+        if key in wanted:
+            found.setdefault(key, []).append(
+                Photo(file.path, file.size, digest, info.st_dev, info.st_ino, info.st_mtime_ns)
+            )
+    return found
+
+
+def _review_quarantine(args: argparse.Namespace) -> int:
+    root = args.folder.expanduser().resolve()
+    with DuplicateHistory(root) as history:
+        latest = history.latest_restorable()
+        if latest is None:
+            print("No quarantined photos available.")
+            return 0
+        batch_id, items = latest
+        if not items:
+            print("No quarantined photos available.")
+            return 0
+        print(f"Quarantine batch #{batch_id}: {len(items)} photo(s) awaiting review")
+        for index, item in enumerate(items, start=1):
+            print(f"  {index}. {item.quarantine_path.relative_to(root)} "
+                  f"({format_size(item.size)}) from {item.source.relative_to(root)}")
+        print(f"Total file size: {format_size(sum(item.size for item in items))}")
+        if args.duplicates_command == "list" or args.preview:
+            print("Preview only: no files were deleted.")
+            return 0
+
+        try:
+            selected = input("Permanently delete which numbers (e.g. 1,3-4 or all)? Enter to cancel: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled. No files were deleted.")
+            return 1
+        if not selected:
+            print("Cancelled. No files were deleted.")
+            return 0
+        try:
+            indexes = (set(range(1, len(items) + 1)) if selected.lower() == "all"
+                       else parse_indexes(selected, len(items)))
+        except SafeSortError as exc:
+            print(f"Invalid selection: {exc}", file=sys.stderr)
+            return 2
+        chosen = [item for index, item in enumerate(items, start=1) if index in indexes]
+        print(f"Selected {len(chosen)} photo(s) for PERMANENT DELETION:")
+        for item in chosen:
+            print(f"  {item.quarantine_path.relative_to(root)}")
+        print("Once deleted, SafeSort cannot restore these copies.")
+        try:
+            confirmation = input(f"Type DELETE {batch_id} to permanently delete: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled. No files were deleted.")
+            return 1
+        if confirmation != f"DELETE {batch_id}":
+            print("Cancelled. No files were deleted.")
+            return 0
+
+        retained = _retained_photo_candidates(root, chosen)
+        deleted = 0
+        skipped = 0
+        for item in chosen:
+            candidates = retained.get((item.size, item.sha256), [])
+            # A matching, still-unchanged outside copy MUST exist at deletion time.
+            if not any(unchanged(candidate) for candidate in candidates):
+                print(f"  skipped {item.quarantine_path.relative_to(root)} "
+                      "(no verified retained matching photo outside quarantine)")
+                skipped += 1
+                continue
+            if not _safe_purge_target(item, root) or not quarantine_identity_matches(item):
+                print(f"  skipped {item.quarantine_path.relative_to(root)} "
+                      "(missing, changed, or unsafe quarantine path)")
+                skipped += 1
+                continue
+            history.begin_purge(item.row_id)
+            try:
+                # Repeat checks immediately before unlink, including retained copy.
+                if not _safe_purge_target(item, root) or not quarantine_identity_matches(item) \
+                   or not any(unchanged(candidate) for candidate in candidates):
+                    history.abort_purge(item.row_id)
+                    skipped += 1
+                    print(f"  skipped {item.quarantine_path.relative_to(root)} (file changed)")
+                    continue
+                item.quarantine_path.unlink()
+            except OSError as exc:
+                # If the file is still identical, deletion definitely didn't occur;
+                # otherwise retain 'purging' for manual inspection, not auto-retry.
+                if quarantine_identity_matches(item):
+                    history.abort_purge(item.row_id)
+                print(f"  FAILED {item.quarantine_path.relative_to(root)} ({exc})")
+                skipped += 1
+                continue
+            history.finish_purge(item.row_id)
+            print(f"  deleted {item.quarantine_path.relative_to(root)}")
+            deleted += 1
+        print(f"Purge: {deleted} permanently deleted, {skipped} skipped/failed.")
+        return 1 if skipped else 0
+
+
+def _safe_purge_target(item: QuarantinedPhoto, root: Path) -> bool:
+    """Only allow journaled regular files under a real, non-symlink quarantine tree."""
+    from safesort.protected import is_photos_library_path
+    from safesort.executor import _path_has_symlink_parent
+    try:
+        relative = item.quarantine_path.relative_to(root)
+    except ValueError:
+        return False
+    if len(relative.parts) < 3 or relative.parts[0] != QUARANTINE_FOLDER:
+        return False
+    if not relative.parts[1].startswith("batch-") or is_photos_library_path(item.quarantine_path):
+        return False
+    if item.quarantine_path.is_symlink() or _path_has_symlink_parent(item.quarantine_path):
+        return False
+    return item.quarantine_path.is_file()
 
 
 def _quarantine_duplicates(args: argparse.Namespace) -> int:
