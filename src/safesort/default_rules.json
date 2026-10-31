@@ -1,0 +1,8 @@
+{
+  "rules": [
+    {"name": "Images",     "extensions": [".jpg", ".jpeg", ".png", ".gif", ".webp"], "destination": "Images"},
+    {"name": "Documents",  "extensions": [".pdf", ".docx", ".doc", ".txt"],          "destination": "Documents"},
+    {"name": "Archives",   "extensions": [".zip", ".gz", ".7z"],                     "destination": "Archives"},
+    {"name": "Installers", "extensions": [".exe", ".msi", ".dmg", ".pkg"],          "destination": "Installers"}
+  ]
+}
