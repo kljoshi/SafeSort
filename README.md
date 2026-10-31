@@ -110,19 +110,6 @@ python -m compileall -q src/safesort
 # Optional if installed:
 mypy --strict src/safesort
 ```
-
-## Roadmap
-
-- [x] Phase 0: project skeleton
-- [x] Phase 1: models and scanner (`scan`)
-- [x] Phase 2: JSON rules and planner (`preview`)
-- [x] Phase 3: executor with conflict handling (`apply`)
-- [x] Phase 4: SQLite history and guarded `undo`
-- [x] Phase 5: CLI history display, exit codes, friendly errors
-- [x] Phase 6: initial no-overwrite, symlink, interrupted-history, and identity tests
-- [ ] Future work: broader cross-platform testing, interruption recovery wizard,
-      filesystem-specific edge-case review, packaging / release automation
-
 **Safety limits:** No file organizer can provide a perfect guarantee against
 concurrent modifications by other processes or filesystem failure. This is a
 local CLI utility with conservative checks, not a backup solution. Keep backups
