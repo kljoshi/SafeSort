@@ -70,9 +70,12 @@ def test_quarantine_and_restore_roundtrip(tmp_path: Path) -> None:
     assert main(["duplicates", "quarantine", str(tmp_path), "--yes"]) == 0
     originals = [p for p in (a, b, c) if p.is_file()]
     assert len(originals) == 1
-    quarantined = list((tmp_path / ".safesort-quarantine").rglob("*.jpg"))
-    quarantined += list((tmp_path / ".safesort-quarantine").rglob("*.JPG"))
-    quarantined += list((tmp_path / ".safesort-quarantine").rglob("*.jpeg"))
+    quarantine_root = tmp_path / ".safesort-quarantine"
+    quarantined = [
+        p
+        for p in quarantine_root.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"}
+    ]
     assert len(quarantined) == 2
     assert find_duplicates([tmp_path]).extra_copies == 0  # exclude quarantine
     assert main(["duplicates", "restore", str(tmp_path), "--yes"]) == 0
