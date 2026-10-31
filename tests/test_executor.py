@@ -186,3 +186,25 @@ def test_symlinked_destination_folder_is_refused(tmp_path: Path) -> None:
     assert outcome.status is MoveStatus.SKIPPED
     assert source.exists()
     assert not (elsewhere / "source.jpg").exists()
+
+
+@pytest.mark.parametrize("protected_source", [True, False])
+def test_refuses_any_move_into_or_out_of_apple_photos_library(
+    tmp_path: Path, protected_source: bool,
+) -> None:
+    bundle = tmp_path / "My Photos.photoslibrary"
+    protected = bundle / "originals" / "photo.jpg"
+    ordinary = tmp_path / "safe" / "photo.jpg"
+    protected.parent.mkdir(parents=True)
+    ordinary.parent.mkdir()
+    protected.write_bytes(b"Photos managed original")
+    ordinary.write_bytes(b"ordinary file")
+    move = make_move(protected, ordinary.parent / "copy.jpg") if protected_source else (
+        make_move(ordinary, bundle / "originals" / "copy.jpg")
+    )
+    result = execute_move(move)
+    assert result.status is MoveStatus.SKIPPED
+    assert "protected Apple Photos library" in result.detail
+    assert protected.read_bytes() == b"Photos managed original"
+    assert ordinary.read_bytes() == b"ordinary file"
+    assert not move.destination.exists()

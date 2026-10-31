@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from safesort.models import MoveResult, MoveStatus, PlannedMove
+from safesort.protected import is_photos_library_path
 
 
 def _path_has_symlink_parent(path: Path) -> bool:
@@ -111,6 +112,10 @@ def execute_move(move: PlannedMove) -> MoveResult:
     """Perform one move and report the outcome, without raising file errors."""
     source, destination = move.source, move.destination
     try:
+        if is_photos_library_path(source) or is_photos_library_path(destination):
+            return MoveResult(move, MoveStatus.SKIPPED, "protected Apple Photos library")
+        if _path_has_symlink_parent(source):
+            return MoveResult(move, MoveStatus.SKIPPED, "source uses a symlinked folder")
         if source.is_symlink():
             return MoveResult(move, MoveStatus.SKIPPED, "source is now a symlink")
         if not source.exists():

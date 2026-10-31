@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 — Exact duplicate photo finder
+
+- Added `duplicates scan` to find SHA-256 identical photos recursively in one
+  or more separately selected folders.
+- Added interactive `duplicates quarantine` to choose the photo to keep for
+  each group, preview the moves, and move extras to a review folder.
+- Added `duplicates restore`, using a separate SQLite journal, to reverse the
+  latest quarantine batch without overwriting existing or modified files.
+- Excluded the quarantine and internal journal folders from recursive scanning.
+- Added cross-platform regression tests, including large Windows file IDs.
+- Also includes the v0.2.0 Windows path test and SQLite file-ID fixes.
+
 ## 0.2.0 — Undo and safety update
 
 - Added SQLite apply history stored per folder under `.safesort`.
