@@ -8,6 +8,7 @@ from pathlib import Path
 from safesort.errors import ScanError
 from safesort.history import HISTORY_FOLDER
 from safesort.models import FileInfo, ScanResult, SkippedEntry
+from safesort.protected import is_photos_library_path
 
 
 def _reason(exc: OSError) -> str:
@@ -35,6 +36,8 @@ def scan(
         ScanError: if ``root`` does not exist or is not a folder.
     """
     root = root.expanduser().resolve()
+    if is_photos_library_path(root):
+        raise ScanError(f"Protected Apple Photos library cannot be scanned: {root}")
     if not root.exists():
         raise ScanError(f"Folder not found: {root}")
     if not root.is_dir():
@@ -52,8 +55,13 @@ def scan(
             continue
 
         for entry in entries:
+            # Apple Photos library bundles are managed by Photos; do not enter
+            # them, even when --hidden or --recursive is used.
+            if is_photos_library_path(entry):
+                result.skipped.append(SkippedEntry(entry, "protected Apple Photos library"))
+                continue
             # Never scan the application journal, even with --hidden.
-            if entry.name == HISTORY_FOLDER:
+            if entry.name in {HISTORY_FOLDER, ".safesort-quarantine"}:
                 continue
             if not include_hidden and entry.name.startswith("."):
                 continue

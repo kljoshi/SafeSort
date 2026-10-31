@@ -101,3 +101,23 @@ def test_unreadable_folder_is_reported_not_fatal(tmp_path: Path) -> None:
 
     assert names(result.files) == ["ok.txt"]
     assert [(s.path, s.reason) for s in result.skipped] == [(locked, "permission denied")]
+
+
+def test_general_scan_skips_photos_libraries(tmp_path: Path) -> None:
+    from safesort.errors import ScanError
+
+    bundle = tmp_path / "Library.photoslibrary"
+    image = bundle / "originals" / "photo.jpeg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"do not touch")
+    regular = tmp_path / "photo.jpeg"
+    regular.write_bytes(b"ordinary")
+
+    result = scan(tmp_path, recursive=True, include_hidden=True)
+    assert [entry.path for entry in result.files] == [regular]
+    assert any(entry.path == bundle and "protected Apple Photos library" in entry.reason
+               for entry in result.skipped)
+    with pytest.raises(ScanError, match="Protected Apple Photos library"):
+        scan(bundle, recursive=True)
+    with pytest.raises(ScanError, match="Protected Apple Photos library"):
+        scan(bundle / "originals", recursive=True)
