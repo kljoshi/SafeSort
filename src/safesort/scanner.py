@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def scan(
     *,
     recursive: bool = False,
     include_hidden: bool = False,
+    on_file: Callable[[FileInfo], None] | None = None,
 ) -> ScanResult:
     """Scan ``root`` and return the files found.
 
@@ -74,13 +76,14 @@ def scan(
                         pending.append(entry)
                 elif entry.is_file():
                     info = entry.stat()
-                    result.files.append(
-                        FileInfo(
-                            path=entry,
-                            size=info.st_size,
-                            modified=datetime.fromtimestamp(info.st_mtime),
-                        )
+                    file_info = FileInfo(
+                        path=entry,
+                        size=info.st_size,
+                        modified=datetime.fromtimestamp(info.st_mtime),
                     )
+                    result.files.append(file_info)
+                    if on_file is not None:
+                        on_file(file_info)
                 else:
                     result.skipped.append(SkippedEntry(entry, "not a regular file"))
             except OSError as exc:

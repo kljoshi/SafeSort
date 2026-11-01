@@ -157,7 +157,30 @@ class DuplicateHistory:
             """).fetchone()
             if batch is None:
                 return None
-            batch_id = int(batch["batch_id"])
+            return self._load_restorable(int(batch["batch_id"]))
+        except sqlite3.Error as exc:
+            raise DuplicateHistoryError(f"Cannot read duplicate history: {exc}") from exc
+
+    def restorable_batch(self, batch_id: int) -> tuple[int, list[QuarantinedPhoto]]:
+        """Read a specific journal batch, even if a newer batch exists.
+
+        Invalid IDs are rejected instead of silently picking another batch.
+        """
+        if batch_id <= 0:
+            raise DuplicateHistoryError("Batch ID must be positive")
+        try:
+            exists = self.connection.execute(
+                "SELECT 1 FROM duplicate_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if exists is None:
+                raise DuplicateHistoryError(f"Unknown quarantine batch #{batch_id}")
+            return self._load_restorable(batch_id)
+        except sqlite3.Error as exc:
+            raise DuplicateHistoryError(f"Cannot read duplicate history: {exc}") from exc
+
+    def _load_restorable(self, batch_id: int) -> tuple[int, list[QuarantinedPhoto]]:
+        """Refuse an interrupted journal state before offering any selections."""
+        try:
             pending = self.connection.execute(
                 "SELECT COUNT(*) FROM duplicate_moves WHERE batch_id=? AND status='pending'",
                 (batch_id,),
@@ -168,17 +191,18 @@ class DuplicateHistory:
                     "Inspect the files and journal manually before restoring or purging."
                 )
             interrupted = self.connection.execute(
-                "SELECT COUNT(*) FROM duplicate_moves WHERE batch_id=? AND restore_status='purging'",
+                """SELECT COUNT(*) FROM duplicate_moves WHERE batch_id=?
+                   AND restore_status IN ('purging', 'restoring')""",
                 (batch_id,),
             ).fetchone()[0]
             if interrupted:
                 raise DuplicateHistoryError(
-                    f"Quarantine batch #{batch_id} has {interrupted} interrupted purge(s). "
-                    "Inspect quarantine and the journal manually; do not retry automatically."
+                    f"Quarantine batch #{batch_id} has {interrupted} interrupted "
+                    "purge/restore operation(s). Inspect quarantine and the journal manually."
                 )
             rows = self.connection.execute("""
                 SELECT * FROM duplicate_moves WHERE batch_id=?
-                AND status='moved' AND restore_status NOT IN ('restored', 'purged', 'purging')
+                AND status='moved' AND restore_status=''
                 ORDER BY ordinal DESC
             """, (batch_id,)).fetchall()
             result: list[QuarantinedPhoto] = []

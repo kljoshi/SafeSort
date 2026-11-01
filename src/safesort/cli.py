@@ -19,6 +19,9 @@ from safesort.executor import execute_move
 from safesort.history import HistoryDB, matches_identity
 from safesort.models import MoveStatus, PlannedMove, ScanResult
 from safesort.planner import plan as build_plan
+from safesort.progress import TerminalProgress
+from safesort.bulk_plan import create_bulk_plan, preferred_folders, save_bulk_plan
+from safesort.bulk_apply import apply_reviewed_plan
 from safesort.rules import load_rules
 from safesort.scanner import scan
 from safesort.selection import parse_indexes, plan_selected
@@ -109,15 +112,31 @@ def build_parser() -> argparse.ArgumentParser:
     dup_scan = dup_sub.add_parser("scan", help="recursively scan one or more photo roots")
     dup_scan.add_argument("folders", nargs="+", type=Path)
     dup_scan.add_argument("--hidden", action="store_true", help="include hidden photos")
+    dup_scan.add_argument("--no-progress", action="store_true", help="disable interactive progress")
     dup_quarantine = dup_sub.add_parser("quarantine", help="review and move extra copies to quarantine")
     dup_quarantine.add_argument("folder", type=Path)
     dup_quarantine.add_argument("--hidden", action="store_true", help="include hidden photos")
+    dup_quarantine.add_argument("--no-progress", action="store_true", help="disable interactive progress")
     dup_quarantine.add_argument("--yes", action="store_true", help="keep first path in each group without prompting")
+    dup_quarantine.add_argument("--bulk", action="store_true", help="preview a bulk plan or apply a previously reviewed plan")
+    dup_quarantine.add_argument("--preview", action="store_true", help="preview choices when generating a bulk plan")
+    dup_quarantine.add_argument("--prefer-path", type=Path, action="append", default=[],
+                                help="folder whose matching photos should be kept (repeat in priority order)")
+    dup_quarantine.add_argument("--plan-file", type=Path,
+                                help="save new reviewable JSON plan; refuses to overwrite")
+    dup_quarantine.add_argument("--apply-plan", type=Path,
+                                help="apply a reviewed JSON plan with revalidation and explicit confirmation")
     dup_restore = dup_sub.add_parser("restore", help="restore the latest quarantined batch")
     dup_restore.add_argument("folder", type=Path)
     dup_restore.add_argument("--yes", action="store_true", help="restore without confirmation")
+    dup_restore.add_argument("--batch", type=int, metavar="ID",
+                             help="restore from this quarantine batch (default: latest pending batch)")
+    dup_restore.add_argument("--files", metavar="NUMBERS",
+                             help="restore only currently listed numbers, e.g. 1,3,5-7")
+    dup_restore.add_argument("--preview", action="store_true", help="preview restore selection without moving files")
     dup_list = dup_sub.add_parser("list", help="list pending photos in the latest quarantine batch")
     dup_list.add_argument("folder", type=Path)
+    dup_list.add_argument("--batch", type=int, metavar="ID", help="show this quarantine batch (default: latest)")
     dup_purge = dup_sub.add_parser("purge", help="permanently delete selected quarantined photos")
     dup_purge.add_argument("folder", type=Path)
     dup_purge.add_argument("--preview", action="store_true", help="show eligible files without deleting")
@@ -312,9 +331,20 @@ def _print_duplicate_report(report: DuplicateScan) -> None:
         print(f"Skipped {path}: {reason}", file=sys.stderr)
 
 
+def _find_duplicates_with_progress(roots: list[Path], args: argparse.Namespace) -> DuplicateScan:
+    # Interactive by default; piped output and CI receive clean, stable text.
+    display = (TerminalProgress(sys.stderr) if sys.stderr.isatty()
+               and not args.no_progress else None)
+    try:
+        return find_duplicates(roots, include_hidden=args.hidden, progress=display)
+    finally:
+        if display is not None:
+            display.finish()
+
+
 def cmd_duplicates(args: argparse.Namespace) -> int:
     if args.duplicates_command == "scan":
-        report = find_duplicates(args.folders, include_hidden=args.hidden)
+        report = _find_duplicates_with_progress(args.folders, args)
         _print_duplicate_report(report)
         print("Preview only: no files were moved or deleted.")
         return 0
@@ -353,7 +383,13 @@ def _retained_photo_candidates(root: Path, items: list[QuarantinedPhoto]) -> dic
 def _review_quarantine(args: argparse.Namespace) -> int:
     root = args.folder.expanduser().resolve()
     with DuplicateHistory(root) as history:
-        latest = history.latest_restorable()
+        if args.duplicates_command == "list" and args.batch is not None:
+            if args.batch < 1:
+                print("error: --batch must be a positive integer", file=sys.stderr)
+                return 2
+            latest = history.restorable_batch(args.batch)
+        else:
+            latest = history.latest_restorable()
         if latest is None:
             print("No quarantined photos available.")
             return 0
@@ -456,8 +492,52 @@ def _safe_purge_target(item: QuarantinedPhoto, root: Path) -> bool:
     return item.quarantine_path.is_file()
 
 
+def _bulk_quarantine_preview(args: argparse.Namespace) -> int:
+    if args.yes:
+        print("error: --yes is not allowed with --bulk", file=sys.stderr)
+        return 2
+    if args.apply_plan is not None:
+        if args.preview or args.plan_file is not None or args.prefer_path or args.hidden:
+            print("error: --apply-plan cannot be combined with preview, plan-file, prefer-path, or hidden", file=sys.stderr)
+            return 2
+        return apply_reviewed_plan(args.folder, args.apply_plan, read_confirmation=input)
+    if not args.preview:
+        print("error: use --bulk --preview --plan-file FILE, or --bulk --apply-plan FILE", file=sys.stderr)
+        return 2
+    if args.plan_file is None:
+        print("error: --bulk --preview requires --plan-file to review decisions", file=sys.stderr)
+        return 2
+
+    # Validate user preferences before doing the expensive scan.
+    root = args.folder.expanduser()
+    if root.is_symlink():
+        raise SafeSortError(f"Scan root cannot be a symlink: {root}")
+    resolved_root = root.resolve()
+    preferences = preferred_folders(resolved_root, args.prefer_path)
+    report = _find_duplicates_with_progress([args.folder], args)
+    plan = create_bulk_plan(report, preferences)
+    target = save_bulk_plan(plan, args.plan_file)
+    print(f"Scanned {plan.photo_count} photo(s); {len(plan.groups)} duplicate group(s)")
+    print(f"Groups ready: {plan.ready_groups}; need review: {plan.needs_review}")
+    print(f"Proposed quarantine: {plan.proposed_copies} photo(s), "
+          f"potential space after later purge: {format_size(plan.potential_bytes)}")
+    for decision in plan.groups[:5]:
+        status = "ready" if decision.keeper else "needs review"
+        print(f"  {status}: {decision.reason}")
+    if len(plan.groups) > 5:
+        print(f"  ... {len(plan.groups) - 5} more groups in the plan file")
+    print(f"Review JSON plan: {target}")
+    print("Preview only: no photos were moved or deleted. Apply separately with --bulk --apply-plan.")
+    return 0
+
+
 def _quarantine_duplicates(args: argparse.Namespace) -> int:
-    report = find_duplicates([args.folder], include_hidden=args.hidden)
+    if args.bulk:
+        return _bulk_quarantine_preview(args)
+    if args.preview or args.prefer_path or args.plan_file is not None or args.apply_plan is not None:
+        print("error: --preview, --prefer-path, --plan-file, and --apply-plan require --bulk", file=sys.stderr)
+        return 2
+    report = _find_duplicates_with_progress([args.folder], args)
     _print_duplicate_report(report)
     if not report.groups:
         print("Nothing to quarantine.")
@@ -469,17 +549,28 @@ def _quarantine_duplicates(args: argparse.Namespace) -> int:
         if args.yes:
             keeper = 1
         else:
-            try:
-                raw = input(f"Group {group_number}: keep which photo [1-{len(group.photos)}], Enter to skip? ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nCancelled. No files were changed.")
-                return 1
+            # Collect all choices before moving any file. A mistyped answer
+            # should repeat this one prompt, not discard earlier decisions.
+            while True:
+                try:
+                    raw = input(
+                        f"Group {group_number}: keep which photo "
+                        f"[1-{len(group.photos)}], Enter to skip? "
+                    ).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nCancelled. No files were changed.")
+                    return 1
+                if not raw:
+                    break
+                if raw.isascii() and raw.isdecimal() and 1 <= int(raw) <= len(group.photos):
+                    keeper = int(raw)
+                    break
+                print(
+                    f"Invalid choice: enter 1-{len(group.photos)}, or press Enter to skip.",
+                    file=sys.stderr,
+                )
             if not raw:
                 continue
-            if not raw.isdecimal() or not 1 <= int(raw) <= len(group.photos):
-                print("Invalid choice. No files were changed.", file=sys.stderr)
-                return 2
-            keeper = int(raw)
         choices.append((group, keeper - 1))
     if not choices:
         print("No groups selected. No files were changed.")
@@ -524,26 +615,97 @@ def _quarantine_duplicates(args: argparse.Namespace) -> int:
     return 1 if counts[MoveStatus.FAILED] or counts[MoveStatus.SKIPPED] else 0
 
 
+def _restore_preflight(item: QuarantinedPhoto, root: Path) -> str | None:
+    """Describe any reason a journaled quarantine move must not be restored.
+
+    Checks are repeated immediately before moving; the executor also rejects
+    overwrite races and symlinked source/destination parents.
+    """
+    import os
+    from safesort.executor import _path_has_symlink_parent
+    from safesort.protected import is_photos_library_path
+
+    try:
+        quarantine_relative = item.quarantine_path.relative_to(root)
+        original_relative = item.source.relative_to(root)
+    except ValueError:
+        return "file path is outside the selected root"
+    if (len(quarantine_relative.parts) < 3
+            or quarantine_relative.parts[0] != QUARANTINE_FOLDER
+            or not quarantine_relative.parts[1].startswith("batch-")):
+        return "journal does not point to a SafeSort quarantine batch"
+    if (not original_relative.parts
+            or original_relative.parts[0] in {QUARANTINE_FOLDER, ".safesort"}):
+        return "original path is within an internal SafeSort folder"
+    if (is_photos_library_path(item.quarantine_path)
+            or is_photos_library_path(item.source)):
+        return "protected Apple Photos library"
+    if (_path_has_symlink_parent(item.quarantine_path)
+            or _path_has_symlink_parent(item.source)):
+        return "source or destination has a symlinked parent"
+    if not quarantine_identity_matches(item):
+        return "quarantined photo is missing, changed, or replaced"
+    if os.path.lexists(item.source):
+        return "original destination already exists"
+    return None
+
+
 def _restore_duplicates(args: argparse.Namespace) -> int:
     from safesort.models import MoveResult
+
+    if args.batch is not None and args.batch < 1:
+        print("error: --batch must be a positive integer", file=sys.stderr)
+        return 2
     root = args.folder.expanduser().resolve()
     with DuplicateHistory(root) as history:
-        latest = history.latest_restorable()
-        if latest is None:
+        latest = (history.restorable_batch(args.batch) if args.batch is not None
+                  else history.latest_restorable())
+        if latest is None or not latest[1]:
             print("Nothing to restore.")
             return 0
         batch_id, items = latest
-        print(f"Restore quarantine batch #{batch_id}: {len(items)} photo(s)")
-        for item in items:
-            print(f"  {item.quarantine_path.relative_to(root)} -> {item.source.relative_to(root)}")
-        if not args.yes and not _confirm(f"Restore these {len(items)} photo(s)? [y/N] "):
+        if args.files is not None:
+            try:
+                selected_indices = parse_indexes(args.files, len(items))
+            except SafeSortError as exc:
+                print(f"Invalid restore selection: {exc}", file=sys.stderr)
+                return 2
+            selected = [item for number, item in enumerate(items, start=1)
+                        if number in selected_indices]
+        else:
+            selected = items
+
+        print(f"Restore quarantine batch #{batch_id}: {len(selected)} of {len(items)} photo(s) selected")
+        # Numbering matches 'duplicates list [--batch ID]' at the instant it is
+        # run. It is refreshed after a partial restore; display paths here too.
+        for number, item in enumerate(items, start=1):
+            if item in selected:
+                print(f"  {number}. {item.quarantine_path.relative_to(root)} -> "
+                      f"{item.source.relative_to(root)}")
+        problems = {item.row_id: reason for item in selected
+                    if (reason := _restore_preflight(item, root)) is not None}
+        for item in selected:
+            if item.row_id in problems:
+                print(f"  blocked {item.source.relative_to(root)} ({problems[item.row_id]})")
+        eligible = len(selected) - len(problems)
+        print(f"Eligible to restore: {eligible}; unavailable or unsafe: {len(problems)}")
+        if args.preview:
+            print("Preview only: no files were moved or deleted.")
+            return 0
+        if not eligible:
+            print("Nothing eligible to restore. No files were changed.")
+            return 1
+        if not args.yes and not _confirm(f"Restore these {eligible} photo(s)? [y/N] "):
             print("Cancelled. No files were changed.")
             return 1
         counts = {status: 0 for status in MoveStatus}
-        for item in items:
+        for item in selected:
             move = PlannedMove(0, item.quarantine_path, item.source, "duplicate-restore")
-            if not quarantine_identity_matches(item):
-                outcome = MoveResult(move, MoveStatus.SKIPPED, "quarantined file changed or is missing")
+            # Re-evaluate after confirmation in case files changed while the
+            # user read the preview or typed their answer.
+            reason = _restore_preflight(item, root)
+            if reason is not None:
+                outcome = MoveResult(move, MoveStatus.SKIPPED, reason)
             else:
                 outcome = execute_move(move)
             history.record_restore(item.row_id, outcome)

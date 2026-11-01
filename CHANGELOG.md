@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 — Work in progress: usability and safety
+
+- Added interactive live progress during photo discovery and SHA-256 hashing.
+- Show candidate photo count, bytes hashed, and elapsed time for long scans.
+- Added `--no-progress` to suppress interactive status output.
+- Invalid quarantine keeper choices now re-prompt instead of aborting all selections.
+- Added read-only JSON bulk quarantine plans with preferred-folder keep rules.
+- Added confirmed bulk plan execution: strict plan parsing, SHA-256 and identity revalidation, skip stale groups, and journal verified moves.
+- Added selective duplicate restore with `--batch`, `--files`, and read-only `--preview`.
+- Added `duplicates list --batch ID` for finding specific quarantine entries.
+- Revalidate quarantined file identity, protected paths, and destination conflicts before restoring.
+- No changes to permanent deletion or legacy interactive quarantine behavior.
+
 ## 0.4.0 — Reviewed duplicate purge
 
 - Added `duplicates list` to inspect files in the latest restorable quarantine batch.
