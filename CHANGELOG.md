@@ -8,6 +8,9 @@
 - Invalid quarantine keeper choices now re-prompt instead of aborting all selections.
 - Added read-only JSON bulk quarantine plans with preferred-folder keep rules.
 - Added confirmed bulk plan execution: strict plan parsing, SHA-256 and identity revalidation, skip stale groups, and journal verified moves.
+- Added selective duplicate restore with `--batch`, `--files`, and read-only `--preview`.
+- Added `duplicates list --batch ID` for finding specific quarantine entries.
+- Revalidate quarantined file identity, protected paths, and destination conflicts before restoring.
 - No changes to permanent deletion or legacy interactive quarantine behavior.
 
 ## 0.4.0 — Reviewed duplicate purge

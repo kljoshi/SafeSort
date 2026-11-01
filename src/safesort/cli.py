@@ -129,8 +129,14 @@ def build_parser() -> argparse.ArgumentParser:
     dup_restore = dup_sub.add_parser("restore", help="restore the latest quarantined batch")
     dup_restore.add_argument("folder", type=Path)
     dup_restore.add_argument("--yes", action="store_true", help="restore without confirmation")
+    dup_restore.add_argument("--batch", type=int, metavar="ID",
+                             help="restore from this quarantine batch (default: latest pending batch)")
+    dup_restore.add_argument("--files", metavar="NUMBERS",
+                             help="restore only currently listed numbers, e.g. 1,3,5-7")
+    dup_restore.add_argument("--preview", action="store_true", help="preview restore selection without moving files")
     dup_list = dup_sub.add_parser("list", help="list pending photos in the latest quarantine batch")
     dup_list.add_argument("folder", type=Path)
+    dup_list.add_argument("--batch", type=int, metavar="ID", help="show this quarantine batch (default: latest)")
     dup_purge = dup_sub.add_parser("purge", help="permanently delete selected quarantined photos")
     dup_purge.add_argument("folder", type=Path)
     dup_purge.add_argument("--preview", action="store_true", help="show eligible files without deleting")
@@ -377,7 +383,13 @@ def _retained_photo_candidates(root: Path, items: list[QuarantinedPhoto]) -> dic
 def _review_quarantine(args: argparse.Namespace) -> int:
     root = args.folder.expanduser().resolve()
     with DuplicateHistory(root) as history:
-        latest = history.latest_restorable()
+        if args.duplicates_command == "list" and args.batch is not None:
+            if args.batch < 1:
+                print("error: --batch must be a positive integer", file=sys.stderr)
+                return 2
+            latest = history.restorable_batch(args.batch)
+        else:
+            latest = history.latest_restorable()
         if latest is None:
             print("No quarantined photos available.")
             return 0
@@ -603,26 +615,97 @@ def _quarantine_duplicates(args: argparse.Namespace) -> int:
     return 1 if counts[MoveStatus.FAILED] or counts[MoveStatus.SKIPPED] else 0
 
 
+def _restore_preflight(item: QuarantinedPhoto, root: Path) -> str | None:
+    """Describe any reason a journaled quarantine move must not be restored.
+
+    Checks are repeated immediately before moving; the executor also rejects
+    overwrite races and symlinked source/destination parents.
+    """
+    import os
+    from safesort.executor import _path_has_symlink_parent
+    from safesort.protected import is_photos_library_path
+
+    try:
+        quarantine_relative = item.quarantine_path.relative_to(root)
+        original_relative = item.source.relative_to(root)
+    except ValueError:
+        return "file path is outside the selected root"
+    if (len(quarantine_relative.parts) < 3
+            or quarantine_relative.parts[0] != QUARANTINE_FOLDER
+            or not quarantine_relative.parts[1].startswith("batch-")):
+        return "journal does not point to a SafeSort quarantine batch"
+    if (not original_relative.parts
+            or original_relative.parts[0] in {QUARANTINE_FOLDER, ".safesort"}):
+        return "original path is within an internal SafeSort folder"
+    if (is_photos_library_path(item.quarantine_path)
+            or is_photos_library_path(item.source)):
+        return "protected Apple Photos library"
+    if (_path_has_symlink_parent(item.quarantine_path)
+            or _path_has_symlink_parent(item.source)):
+        return "source or destination has a symlinked parent"
+    if not quarantine_identity_matches(item):
+        return "quarantined photo is missing, changed, or replaced"
+    if os.path.lexists(item.source):
+        return "original destination already exists"
+    return None
+
+
 def _restore_duplicates(args: argparse.Namespace) -> int:
     from safesort.models import MoveResult
+
+    if args.batch is not None and args.batch < 1:
+        print("error: --batch must be a positive integer", file=sys.stderr)
+        return 2
     root = args.folder.expanduser().resolve()
     with DuplicateHistory(root) as history:
-        latest = history.latest_restorable()
-        if latest is None:
+        latest = (history.restorable_batch(args.batch) if args.batch is not None
+                  else history.latest_restorable())
+        if latest is None or not latest[1]:
             print("Nothing to restore.")
             return 0
         batch_id, items = latest
-        print(f"Restore quarantine batch #{batch_id}: {len(items)} photo(s)")
-        for item in items:
-            print(f"  {item.quarantine_path.relative_to(root)} -> {item.source.relative_to(root)}")
-        if not args.yes and not _confirm(f"Restore these {len(items)} photo(s)? [y/N] "):
+        if args.files is not None:
+            try:
+                selected_indices = parse_indexes(args.files, len(items))
+            except SafeSortError as exc:
+                print(f"Invalid restore selection: {exc}", file=sys.stderr)
+                return 2
+            selected = [item for number, item in enumerate(items, start=1)
+                        if number in selected_indices]
+        else:
+            selected = items
+
+        print(f"Restore quarantine batch #{batch_id}: {len(selected)} of {len(items)} photo(s) selected")
+        # Numbering matches 'duplicates list [--batch ID]' at the instant it is
+        # run. It is refreshed after a partial restore; display paths here too.
+        for number, item in enumerate(items, start=1):
+            if item in selected:
+                print(f"  {number}. {item.quarantine_path.relative_to(root)} -> "
+                      f"{item.source.relative_to(root)}")
+        problems = {item.row_id: reason for item in selected
+                    if (reason := _restore_preflight(item, root)) is not None}
+        for item in selected:
+            if item.row_id in problems:
+                print(f"  blocked {item.source.relative_to(root)} ({problems[item.row_id]})")
+        eligible = len(selected) - len(problems)
+        print(f"Eligible to restore: {eligible}; unavailable or unsafe: {len(problems)}")
+        if args.preview:
+            print("Preview only: no files were moved or deleted.")
+            return 0
+        if not eligible:
+            print("Nothing eligible to restore. No files were changed.")
+            return 1
+        if not args.yes and not _confirm(f"Restore these {eligible} photo(s)? [y/N] "):
             print("Cancelled. No files were changed.")
             return 1
         counts = {status: 0 for status in MoveStatus}
-        for item in items:
+        for item in selected:
             move = PlannedMove(0, item.quarantine_path, item.source, "duplicate-restore")
-            if not quarantine_identity_matches(item):
-                outcome = MoveResult(move, MoveStatus.SKIPPED, "quarantined file changed or is missing")
+            # Re-evaluate after confirmation in case files changed while the
+            # user read the preview or typed their answer.
+            reason = _restore_preflight(item, root)
+            if reason is not None:
+                outcome = MoveResult(move, MoveStatus.SKIPPED, reason)
             else:
                 outcome = execute_move(move)
             history.record_restore(item.row_id, outcome)
