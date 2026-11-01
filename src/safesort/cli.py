@@ -20,6 +20,8 @@ from safesort.history import HistoryDB, matches_identity
 from safesort.models import MoveStatus, PlannedMove, ScanResult
 from safesort.planner import plan as build_plan
 from safesort.progress import TerminalProgress
+from safesort.bulk_plan import create_bulk_plan, preferred_folders, save_bulk_plan
+from safesort.bulk_apply import apply_reviewed_plan
 from safesort.rules import load_rules
 from safesort.scanner import scan
 from safesort.selection import parse_indexes, plan_selected
@@ -116,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
     dup_quarantine.add_argument("--hidden", action="store_true", help="include hidden photos")
     dup_quarantine.add_argument("--no-progress", action="store_true", help="disable interactive progress")
     dup_quarantine.add_argument("--yes", action="store_true", help="keep first path in each group without prompting")
+    dup_quarantine.add_argument("--bulk", action="store_true", help="preview a bulk plan or apply a previously reviewed plan")
+    dup_quarantine.add_argument("--preview", action="store_true", help="preview choices when generating a bulk plan")
+    dup_quarantine.add_argument("--prefer-path", type=Path, action="append", default=[],
+                                help="folder whose matching photos should be kept (repeat in priority order)")
+    dup_quarantine.add_argument("--plan-file", type=Path,
+                                help="save new reviewable JSON plan; refuses to overwrite")
+    dup_quarantine.add_argument("--apply-plan", type=Path,
+                                help="apply a reviewed JSON plan with revalidation and explicit confirmation")
     dup_restore = dup_sub.add_parser("restore", help="restore the latest quarantined batch")
     dup_restore.add_argument("folder", type=Path)
     dup_restore.add_argument("--yes", action="store_true", help="restore without confirmation")
@@ -470,7 +480,51 @@ def _safe_purge_target(item: QuarantinedPhoto, root: Path) -> bool:
     return item.quarantine_path.is_file()
 
 
+def _bulk_quarantine_preview(args: argparse.Namespace) -> int:
+    if args.yes:
+        print("error: --yes is not allowed with --bulk", file=sys.stderr)
+        return 2
+    if args.apply_plan is not None:
+        if args.preview or args.plan_file is not None or args.prefer_path or args.hidden:
+            print("error: --apply-plan cannot be combined with preview, plan-file, prefer-path, or hidden", file=sys.stderr)
+            return 2
+        return apply_reviewed_plan(args.folder, args.apply_plan, read_confirmation=input)
+    if not args.preview:
+        print("error: use --bulk --preview --plan-file FILE, or --bulk --apply-plan FILE", file=sys.stderr)
+        return 2
+    if args.plan_file is None:
+        print("error: --bulk --preview requires --plan-file to review decisions", file=sys.stderr)
+        return 2
+
+    # Validate user preferences before doing the expensive scan.
+    root = args.folder.expanduser()
+    if root.is_symlink():
+        raise SafeSortError(f"Scan root cannot be a symlink: {root}")
+    resolved_root = root.resolve()
+    preferences = preferred_folders(resolved_root, args.prefer_path)
+    report = _find_duplicates_with_progress([args.folder], args)
+    plan = create_bulk_plan(report, preferences)
+    target = save_bulk_plan(plan, args.plan_file)
+    print(f"Scanned {plan.photo_count} photo(s); {len(plan.groups)} duplicate group(s)")
+    print(f"Groups ready: {plan.ready_groups}; need review: {plan.needs_review}")
+    print(f"Proposed quarantine: {plan.proposed_copies} photo(s), "
+          f"potential space after later purge: {format_size(plan.potential_bytes)}")
+    for decision in plan.groups[:5]:
+        status = "ready" if decision.keeper else "needs review"
+        print(f"  {status}: {decision.reason}")
+    if len(plan.groups) > 5:
+        print(f"  ... {len(plan.groups) - 5} more groups in the plan file")
+    print(f"Review JSON plan: {target}")
+    print("Preview only: no photos were moved or deleted. Apply separately with --bulk --apply-plan.")
+    return 0
+
+
 def _quarantine_duplicates(args: argparse.Namespace) -> int:
+    if args.bulk:
+        return _bulk_quarantine_preview(args)
+    if args.preview or args.prefer_path or args.plan_file is not None or args.apply_plan is not None:
+        print("error: --preview, --prefer-path, --plan-file, and --apply-plan require --bulk", file=sys.stderr)
+        return 2
     report = _find_duplicates_with_progress([args.folder], args)
     _print_duplicate_report(report)
     if not report.groups:
