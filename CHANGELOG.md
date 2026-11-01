@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 — Work in progress: scan progress and input safety
+
+- Added interactive live progress during photo discovery and SHA-256 hashing.
+- Show candidate photo count, bytes hashed, and elapsed time for long scans.
+- Added `--no-progress` to suppress interactive status output.
+- Invalid quarantine keeper choices now re-prompt instead of aborting all selections.
+- No changes to duplicate classification, quarantine move semantics, or deletion behavior.
+
 ## 0.4.0 — Reviewed duplicate purge
 
 - Added `duplicates list` to inspect files in the latest restorable quarantine batch.

@@ -19,6 +19,7 @@ from safesort.executor import execute_move
 from safesort.history import HistoryDB, matches_identity
 from safesort.models import MoveStatus, PlannedMove, ScanResult
 from safesort.planner import plan as build_plan
+from safesort.progress import TerminalProgress
 from safesort.rules import load_rules
 from safesort.scanner import scan
 from safesort.selection import parse_indexes, plan_selected
@@ -109,9 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     dup_scan = dup_sub.add_parser("scan", help="recursively scan one or more photo roots")
     dup_scan.add_argument("folders", nargs="+", type=Path)
     dup_scan.add_argument("--hidden", action="store_true", help="include hidden photos")
+    dup_scan.add_argument("--no-progress", action="store_true", help="disable interactive progress")
     dup_quarantine = dup_sub.add_parser("quarantine", help="review and move extra copies to quarantine")
     dup_quarantine.add_argument("folder", type=Path)
     dup_quarantine.add_argument("--hidden", action="store_true", help="include hidden photos")
+    dup_quarantine.add_argument("--no-progress", action="store_true", help="disable interactive progress")
     dup_quarantine.add_argument("--yes", action="store_true", help="keep first path in each group without prompting")
     dup_restore = dup_sub.add_parser("restore", help="restore the latest quarantined batch")
     dup_restore.add_argument("folder", type=Path)
@@ -312,9 +315,20 @@ def _print_duplicate_report(report: DuplicateScan) -> None:
         print(f"Skipped {path}: {reason}", file=sys.stderr)
 
 
+def _find_duplicates_with_progress(roots: list[Path], args: argparse.Namespace) -> DuplicateScan:
+    # Interactive by default; piped output and CI receive clean, stable text.
+    display = (TerminalProgress(sys.stderr) if sys.stderr.isatty()
+               and not args.no_progress else None)
+    try:
+        return find_duplicates(roots, include_hidden=args.hidden, progress=display)
+    finally:
+        if display is not None:
+            display.finish()
+
+
 def cmd_duplicates(args: argparse.Namespace) -> int:
     if args.duplicates_command == "scan":
-        report = find_duplicates(args.folders, include_hidden=args.hidden)
+        report = _find_duplicates_with_progress(args.folders, args)
         _print_duplicate_report(report)
         print("Preview only: no files were moved or deleted.")
         return 0
@@ -457,7 +471,7 @@ def _safe_purge_target(item: QuarantinedPhoto, root: Path) -> bool:
 
 
 def _quarantine_duplicates(args: argparse.Namespace) -> int:
-    report = find_duplicates([args.folder], include_hidden=args.hidden)
+    report = _find_duplicates_with_progress([args.folder], args)
     _print_duplicate_report(report)
     if not report.groups:
         print("Nothing to quarantine.")
@@ -469,17 +483,28 @@ def _quarantine_duplicates(args: argparse.Namespace) -> int:
         if args.yes:
             keeper = 1
         else:
-            try:
-                raw = input(f"Group {group_number}: keep which photo [1-{len(group.photos)}], Enter to skip? ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nCancelled. No files were changed.")
-                return 1
+            # Collect all choices before moving any file. A mistyped answer
+            # should repeat this one prompt, not discard earlier decisions.
+            while True:
+                try:
+                    raw = input(
+                        f"Group {group_number}: keep which photo "
+                        f"[1-{len(group.photos)}], Enter to skip? "
+                    ).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nCancelled. No files were changed.")
+                    return 1
+                if not raw:
+                    break
+                if raw.isascii() and raw.isdecimal() and 1 <= int(raw) <= len(group.photos):
+                    keeper = int(raw)
+                    break
+                print(
+                    f"Invalid choice: enter 1-{len(group.photos)}, or press Enter to skip.",
+                    file=sys.stderr,
+                )
             if not raw:
                 continue
-            if not raw.isdecimal() or not 1 <= int(raw) <= len(group.photos):
-                print("Invalid choice. No files were changed.", file=sys.stderr)
-                return 2
-            keeper = int(raw)
         choices.append((group, keeper - 1))
     if not choices:
         print("No groups selected. No files were changed.")
